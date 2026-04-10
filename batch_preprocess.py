@@ -5,15 +5,7 @@ Scans a directory of .txt lyric files, outputs .json animation scripts.
 import sys
 import json
 from pathlib import Path
-from preprocess_lyrics import (
-    parse_lyrics,
-    detect_chorus_by_repetition,
-    build_segments,
-    fill_gaps,
-    sanitize_segments,
-    merge_adjacent,
-    compress_short_segments,
-)
+from preprocess_lyrics import parse_lyrics, lrcjson_dict, segments_from_lyrics
 
 
 def process_one(txt_path: Path, out_dir: Path) -> dict:
@@ -27,18 +19,8 @@ def process_one(txt_path: Path, out_dir: Path) -> dict:
     if not lyrics:
         return {"song_id": song_id, "status": "EMPTY"}
 
-    chorus_idx = detect_chorus_by_repetition(lyrics, window=3)
-    segments = build_segments(lyrics, chorus_idx)
-    segments = fill_gaps(segments)
-    segments = sanitize_segments(segments)
-    segments = merge_adjacent(segments)
-    segments = compress_short_segments(segments)
-
-    output = {
-        "version": 1,
-        "song_id": song_id,
-        "segments": segments,
-    }
+    segments, chorus_idx = segments_from_lyrics(lyrics, window=3)
+    output = lrcjson_dict(song_id, segments)
 
     out_path = out_dir / f"{song_id}.json"
     out_path.write_text(json.dumps(output, ensure_ascii=False, indent=2), encoding="utf-8")
