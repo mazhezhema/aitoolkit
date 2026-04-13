@@ -19,6 +19,52 @@ class CsvLrctxtToLrcjsonTests(unittest.TestCase):
             self.assertIsNone(text)
             self.assertEqual(err, "TOO_LARGE>10")
 
+    def test_fetch_text_local_falls_back_to_gb18030_when_utf8_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "gbk.txt"
+            content = "[00:00.000]你好\n<1000,0>\n"
+            path.write_bytes(content.encode("gb18030"))
+
+            text, err = mod.fetch_text(str(path), encoding="utf-8", timeout=1, max_bytes=1024)
+
+            self.assertEqual(err, "")
+            self.assertEqual(text, content)
+
+    def test_fetch_text_detailed_reports_fallback_decode_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "gbk.txt"
+            content = "[00:00.000]你好\n<1000,0>\n"
+            path.write_bytes(content.encode("gb18030"))
+
+            text, err, decode_mode = mod.fetch_text_detailed(
+                str(path),
+                encoding="utf-8",
+                timeout=1,
+                max_bytes=1024,
+                lossy_decode=False,
+            )
+
+            self.assertEqual(err, "")
+            self.assertEqual(text, content)
+            self.assertEqual(decode_mode, "fallback")
+
+    def test_fetch_text_detailed_can_use_lossy_decode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "lossy.txt"
+            path.write_bytes(b"[00:00.000]\xff\xfe\n<1000,0>\n")
+
+            text, err, decode_mode = mod.fetch_text_detailed(
+                str(path),
+                encoding="utf-8",
+                timeout=1,
+                max_bytes=1024,
+                lossy_decode=True,
+            )
+
+            self.assertEqual(err, "")
+            self.assertIn("\ufffd", text)
+            self.assertEqual(decode_mode, "lossy")
+
     def test_process_row_converts_build_failure_to_process_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             src = Path(tmp) / "song.txt"
@@ -71,8 +117,8 @@ class CsvLrctxtToLrcjsonTests(unittest.TestCase):
     def test_fetch_text_with_retry_retries_once_then_succeeds(self) -> None:
         with mock.patch.object(
             mod,
-            "fetch_text",
-            side_effect=[(None, "TIMEOUT"), ("hello", "")],
+            "fetch_text_detailed",
+            side_effect=[(None, "TIMEOUT", "failed"), ("hello", "", "exact")],
         ) as fetch_mock, mock.patch.object(mod.time, "sleep") as sleep_mock:
             text, err = mod.fetch_text_with_retry(
                 "https://example.com/song.txt",
@@ -111,7 +157,7 @@ class CsvLrctxtToLrcjsonTests(unittest.TestCase):
 
     def test_process_row_require_remote_allows_https_source(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            with mock.patch.object(mod, "fetch_text_with_retry", return_value=("hello", "")):
+            with mock.patch.object(mod, "fetch_text_with_retry_detailed", return_value=("hello", "", "exact")):
                 with mock.patch.object(mod, "parse_lyrics_text", return_value=[{"text": "hello", "start": 0, "end": 1000, "duration": 1000, "normalized_text": "hello"}]):
                     with mock.patch.object(mod, "build_lrcjson", return_value={"version": 1, "song_id": "songid", "segments": []}):
                         result = mod.process_row(

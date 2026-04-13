@@ -62,36 +62,75 @@ def _stderr(*args: object) -> None:
     print(*args, file=sys.stderr, flush=True)
 
 
+def candidate_decodings(primary_encoding: str) -> list[str]:
+    """Decode order for lyric text; keep primary first, then practical fallbacks."""
+    normalized = primary_encoding.lower()
+    candidates = [primary_encoding]
+    if normalized == "utf-8":
+        candidates.extend(["utf-8-sig", "gb18030"])
+    elif normalized == "utf-8-sig":
+        candidates.extend(["utf-8", "gb18030"])
+    elif normalized != "gb18030":
+        candidates.append("gb18030")
+
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for item in candidates:
+        key = item.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(item)
+    return ordered
+
+
+def decode_text_bytes(
+    data: bytes,
+    primary_encoding: str,
+    *,
+    lossy_decode: bool = False,
+) -> tuple[str | None, str, str]:
+    """Decode bytes using primary encoding and pragmatic fallbacks."""
+    last_error: UnicodeDecodeError | None = None
+    for idx, encoding in enumerate(candidate_decodings(primary_encoding)):
+        try:
+            mode = "exact" if idx == 0 else "fallback"
+            return data.decode(encoding), "", mode
+        except UnicodeDecodeError as e:
+            last_error = e
+    if lossy_decode:
+        return data.decode(primary_encoding, errors="replace"), "", "lossy"
+    return None, f"DECODE:{last_error}" if last_error else "DECODE:unknown", "failed"
+
+
 def read_local_text_with_limit(
     path: Path,
     *,
     encoding: str,
     max_bytes: int,
-) -> tuple[str | None, str]:
+    lossy_decode: bool = False,
+) -> tuple[str | None, str, str]:
     """Read local file with a hard byte cap before decoding."""
     try:
         if path.stat().st_size > max_bytes:
-            return None, f"TOO_LARGE>{max_bytes}"
+            return None, f"TOO_LARGE>{max_bytes}", "failed"
     except FileNotFoundError:
-        return None, "FILE_NOT_FOUND"
+        return None, "FILE_NOT_FOUND", "failed"
     except OSError as e:
-        return None, f"FILE_IO:{e}"
+        return None, f"FILE_IO:{e}", "failed"
 
     try:
         with path.open("rb") as f:
             data = f.read(max_bytes + 1)
     except FileNotFoundError:
-        return None, "FILE_NOT_FOUND"
+        return None, "FILE_NOT_FOUND", "failed"
     except OSError as e:
-        return None, f"FILE_IO:{e}"
+        return None, f"FILE_IO:{e}", "failed"
 
     if len(data) > max_bytes:
-        return None, f"TOO_LARGE>{max_bytes}"
+        return None, f"TOO_LARGE>{max_bytes}", "failed"
 
-    try:
-        return data.decode(encoding), ""
-    except UnicodeDecodeError as e:
-        return None, f"DECODE:{e}"
+    return decode_text_bytes(data, encoding, lossy_decode=lossy_decode)
 
 
 def is_retryable_fetch_error(source: str, err: str) -> bool:
@@ -122,23 +161,47 @@ def fetch_text_with_retry(
     retries: int,
     retry_backoff: float,
 ) -> tuple[str | None, str]:
+    text, err, _ = fetch_text_with_retry_detailed(
+        source,
+        encoding=encoding,
+        timeout=timeout,
+        max_bytes=max_bytes,
+        retries=retries,
+        retry_backoff=retry_backoff,
+        lossy_decode=False,
+    )
+    return text, err
+
+
+def fetch_text_with_retry_detailed(
+    source: str,
+    *,
+    encoding: str,
+    timeout: float,
+    max_bytes: int,
+    retries: int,
+    retry_backoff: float,
+    lossy_decode: bool = False,
+) -> tuple[str | None, str, str]:
     """Fetch text with bounded retries for transient HTTP failures."""
     attempts = max(0, retries) + 1
     last_text: str | None = None
     last_err = ""
+    last_mode = "failed"
     for attempt in range(attempts):
-        last_text, last_err = fetch_text(
+        last_text, last_err, last_mode = fetch_text_detailed(
             source,
             encoding=encoding,
             timeout=timeout,
             max_bytes=max_bytes,
+            lossy_decode=lossy_decode,
         )
         if not last_err:
-            return last_text, ""
+            return last_text, "", last_mode
         if attempt == attempts - 1 or not is_retryable_fetch_error(source, last_err):
             break
         time.sleep(retry_backoff * (2 ** attempt))
-    return last_text, last_err
+    return last_text, last_err, last_mode
 
 
 def song_id_shard_hex(song_id: str) -> tuple[str, str]:
@@ -181,13 +244,31 @@ def fetch_text(
     timeout: float,
     max_bytes: int,
 ) -> tuple[str | None, str]:
+    text, err, _ = fetch_text_detailed(
+        source,
+        encoding=encoding,
+        timeout=timeout,
+        max_bytes=max_bytes,
+        lossy_decode=False,
+    )
+    return text, err
+
+
+def fetch_text_detailed(
+    source: str,
+    *,
+    encoding: str,
+    timeout: float,
+    max_bytes: int,
+    lossy_decode: bool = False,
+) -> tuple[str | None, str, str]:
     """
     Load lrctxt as string. Returns (text, error_message).
     error_message empty on success.
     """
     s = source.strip()
     if not s:
-        return None, "EMPTY_SOURCE"
+        return None, "EMPTY_SOURCE", "failed"
 
     if s.lower().startswith(("http://", "https://")):
         req = urllib.request.Request(
@@ -200,30 +281,27 @@ def fetch_text(
             with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
                 data = resp.read(max_bytes + 1)
         except urllib.error.HTTPError as e:
-            return None, f"HTTP_{e.code}"
+            return None, f"HTTP_{e.code}", "failed"
         except urllib.error.URLError as e:
-            return None, f"URL_ERROR:{e.reason!r}"
+            return None, f"URL_ERROR:{e.reason!r}", "failed"
         except TimeoutError:
-            return None, "TIMEOUT"
+            return None, "TIMEOUT", "failed"
         except OSError as e:
-            return None, f"IO:{e}"
+            return None, f"IO:{e}", "failed"
 
         if len(data) > max_bytes:
-            return None, f"TOO_LARGE>{max_bytes}"
-        try:
-            return data.decode(encoding), ""
-        except UnicodeDecodeError as e:
-            return None, f"DECODE:{e}"
+            return None, f"TOO_LARGE>{max_bytes}", "failed"
+        return decode_text_bytes(data, encoding, lossy_decode=lossy_decode)
 
     if s.lower().startswith("file://"):
         try:
             local = file_url_to_path(s)
         except (ValueError, OSError) as e:
-            return None, f"FILE_URL:{e}"
+            return None, f"FILE_URL:{e}", "failed"
     else:
         local = Path(os.path.expanduser(s))
 
-    return read_local_text_with_limit(local, encoding=encoding, max_bytes=max_bytes)
+    return read_local_text_with_limit(local, encoding=encoding, max_bytes=max_bytes, lossy_decode=lossy_decode)
 
 
 def _sniff_csv_dialect(sample: str):
@@ -306,6 +384,7 @@ def process_row(
     retries: int = 0,
     retry_backoff: float = 0.5,
     require_remote: bool = False,
+    lossy_decode: bool = False,
 ) -> dict[str, Any]:
     """Process one CSV row; returns result dict for logging / errors."""
     explicit_sid = (song_id or "").strip()
@@ -348,13 +427,14 @@ def process_row(
             "out_path": str(out_path),
         }
 
-    text, err = fetch_text_with_retry(
+    text, err, decode_mode = fetch_text_with_retry_detailed(
         source,
         encoding=encoding,
         timeout=timeout,
         max_bytes=max_bytes,
         retries=retries,
         retry_backoff=retry_backoff,
+        lossy_decode=lossy_decode,
     )
     if err:
         low = source.strip().lower()
@@ -426,6 +506,7 @@ def process_row(
         "source": source,
         "status": "OK",
         "detail": "",
+        "decode_mode": decode_mode,
         "relative_path": rel_str,
         "sha256_json": content_hash,
         "out_path": str(out_path),
@@ -486,6 +567,7 @@ def main() -> int:
     ap.add_argument("--manifest", action="store_true", help="Write manifest.jsonl under out-dir")
     ap.add_argument("--skip-existing", action="store_true", help="Skip rows whose target JSON already exists")
     ap.add_argument("--require-remote", action="store_true", help="Reject non-http(s) sources as SOURCE_ERROR")
+    ap.add_argument("--lossy-decode", action="store_true", help="After normal decode fallbacks fail, decode with replacement to preserve timing structure")
     ap.add_argument("--retries", type=int, default=0, help="Retry transient HTTP fetch failures N times")
     ap.add_argument("--retry-backoff", type=float, default=0.5, help="Base retry backoff seconds (exponential)")
     ap.add_argument(
@@ -550,6 +632,7 @@ def main() -> int:
             retries=args.retries,
             retry_backoff=args.retry_backoff,
             require_remote=args.require_remote,
+            lossy_decode=args.lossy_decode,
         )
 
     ok = 0
@@ -583,6 +666,7 @@ def main() -> int:
             man = {
                 "song_id": r["song_id"],
                 "source_url": r["source"],
+                "decode_mode": r.get("decode_mode", "exact"),
                 "relative_path": r["relative_path"],
                 "sha256_json": r.get("sha256_json", ""),
             }
