@@ -40,6 +40,22 @@ ENV/
 env.bak/
 venv.bak/
 
+# C / C++ build artifacts
+*.o
+*.a
+*.exe
+*.so
+*.dylib
+
+# score SDK build outputs
+score/examples/demo_linux
+score/examples/smoke_lrctxt
+score/examples/smoke_score_core
+
+# Test data / scratch
+_test_txt_out/
+errors.jsonl
+
 # Project specific
 .DS_Store
 Thumbs.db

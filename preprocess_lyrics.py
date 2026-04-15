@@ -32,9 +32,8 @@ def normalize_lyric_text(text: str) -> str:
     return NORMALIZE_RE.sub("", text).lower()
 
 
-def parse_lyrics(filepath: str) -> list[dict]:
-    """Parse lyrics file into structured lines."""
-    lines = Path(filepath).read_text(encoding="utf-8").splitlines()
+def parse_lyrics_lines(lines: list[str]) -> list[dict]:
+    """Parse KRC-like lyric lines into structured line dicts."""
     result = []
     i = 0
     while i < len(lines):
@@ -71,6 +70,47 @@ def parse_lyrics(filepath: str) -> list[dict]:
         i += 1
 
     return result
+
+
+def parse_lyrics_text(text: str) -> list[dict]:
+    """Parse lyrics from full file text (UTF-8 decoded string)."""
+    return parse_lyrics_lines(text.splitlines())
+
+
+def parse_lyrics(filepath: str) -> list[dict]:
+    """Parse lyrics file into structured lines."""
+    lines = Path(filepath).read_text(encoding="utf-8").splitlines()
+    return parse_lyrics_lines(lines)
+
+
+def segments_from_lyrics(lyrics_lines: list[dict], window: int = 3) -> tuple[list[dict], set[int]]:
+    """
+    Run chorus detection + segment pipeline. Returns (segments, chorus_line_indices).
+    """
+    chorus_idx = detect_chorus_by_repetition(lyrics_lines, window=window)
+    segments = build_segments(lyrics_lines, chorus_idx)
+    segments = fill_gaps(segments)
+    segments = sanitize_segments(segments)
+    segments = merge_adjacent(segments)
+    segments = compress_short_segments(segments)
+    return segments, chorus_idx
+
+
+def lrcjson_dict(song_id: str, segments: list[dict]) -> dict:
+    """Assemble version/song_id/segments payload (no lyric processing)."""
+    return {
+        "version": 1,
+        "song_id": song_id,
+        "segments": segments,
+    }
+
+
+def build_lrcjson(song_id: str, lyrics_lines: list[dict], window: int = 3) -> dict:
+    """
+    Build client-ready JSON: version, song_id, segments (idle/sing/chorus).
+    """
+    segments, _ = segments_from_lyrics(lyrics_lines, window=window)
+    return lrcjson_dict(song_id, segments)
 
 
 def _block_duration(lyrics_lines: list[dict], start_idx: int, length: int) -> int:
@@ -419,20 +459,13 @@ def main():
               f"({l['duration']:5d}ms)  {l['text']}")
     print()
 
-    # Detect chorus
-    chorus_idx = detect_chorus_by_repetition(lyrics, window=3)
+    # Detect chorus + build segments
+    segments, chorus_idx = segments_from_lyrics(lyrics, window=3)
     print(f"=== Chorus Detection ===")
     print(f"Chorus lines (by repetition): {sorted(chorus_idx)}")
     for i in sorted(chorus_idx):
         print(f"  [{i:2d}] {lyrics[i]['text']}")
     print()
-
-    # Build segments
-    segments = build_segments(lyrics, chorus_idx)
-    segments = fill_gaps(segments)
-    segments = sanitize_segments(segments)
-    segments = merge_adjacent(segments)
-    segments = compress_short_segments(segments)
 
     # Print timeline
     print("=== Animation Timeline ===")
@@ -448,11 +481,7 @@ def main():
 
     # Output JSON
     song_id = Path(filepath).stem
-    output = {
-        "version": 1,
-        "song_id": song_id,
-        "segments": segments,
-    }
+    output = build_lrcjson(song_id, lyrics)
 
     out_path = Path(filepath).with_suffix(".json")
     out_path.write_text(json.dumps(output, ensure_ascii=False, indent=2), encoding="utf-8")
